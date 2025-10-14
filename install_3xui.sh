@@ -14,24 +14,6 @@ apt install -y curl wget unzip sudo git ufw
 echo "🔹 Устанавливаем 3X-UI..."
 bash <(curl -Ls https://raw.githubusercontent.com/mhsanaei/3x-ui/master/install.sh)
 
-echo ""
-echo "🔹 Проверяем, установлен ли frontend..."
-if [ ! -d "/usr/local/x-ui/web" ]; then
-    echo "⚙️  Веб-панель отсутствует — скачиваем..."
-    mkdir -p /usr/local/x-ui/web
-    cd /usr/local/x-ui/web || exit
-
-    # Пробуем несколько источников фронтенда
-    wget -q --show-progress https://github.com/FranzKafkaYu/x-ui-frontend/archive/refs/heads/master.zip -O frontend.zip || \
-    wget -q --show-progress https://github.com/MHSanaei/3x-ui-frontend/archive/refs/heads/master.zip -O frontend.zip
-
-    unzip -oq frontend.zip || echo "⚠️ Не удалось распаковать frontend.zip"
-    mv x-ui-frontend-*/* /usr/local/x-ui/web/ 2>/dev/null || true
-    rm -f frontend.zip
-    cd /usr/local/x-ui || exit
-else
-    echo "✅ Веб-панель уже установлена."
-fi
 
 echo ""
 echo "🔹 Открываем порты..."
