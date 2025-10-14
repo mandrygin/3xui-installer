@@ -1,17 +1,32 @@
+#!/bin/bash
+# =======================================
 # Автоматическая установка 3X-UI на Ubuntu/Debian
 # Автор: ChatGPT (для nutson.us)
 # =======================================
 
 set -e
+export DEBIAN_FRONTEND=noninteractive
+
+# Проверка root
+if [ "$EUID" -ne 0 ]; then
+  echo "❌ Пожалуйста, запустите скрипт с правами root (sudo)"
+  exit 1
+fi
 
 echo "🔹 Обновляем систему..."
-apt update -y && apt upgrade -y
+apt update -y && apt upgrade -yq
 
 echo "🔹 Устанавливаем зависимости..."
 apt install -y curl wget unzip sudo ufw
 
 echo "🔹 Устанавливаем 3X-UI..."
 bash <(curl -Ls https://raw.githubusercontent.com/mhsanaei/3x-ui/master/install.sh)
+
+# Проверка наличия веб-панели
+if [ ! -d "/usr/local/x-ui/web" ] || [ -z "$(ls -A /usr/local/x-ui/web)" ]; then
+  echo "⚠️ Web-панель не найдена — выполняем reinstall..."
+  x-ui reinstall
+fi
 
 echo "✅ Установка 3X-UI завершена."
 
@@ -37,13 +52,18 @@ echo ""
 
 x-ui setting -username $PANEL_USER -password $PANEL_PASS -port $PANEL_PORT
 
-IP=$(curl -s ipv4.icanhazip.com)
+# Определяем IP (локальный, если есть)
+LOCAL_IP=$(hostname -I | awk '{print $1}')
+IP=${LOCAL_IP:-$(curl -s ipv4.icanhazip.com)}
+
+x-ui restart
+sleep 2
 
 echo ""
 echo "=========================================="
 echo "✅ 3X-UI успешно установлена!"
 echo "------------------------------------------"
-echo "🌐 Веб-панель: http://$IP:$PANEL_PORT"
+echo "🌐 Веб-панель: http://$IP:$PANEL_PORT/panel"
 echo "👤 Логин: $PANEL_USER"
 echo "🔑 Пароль: $PANEL_PASS"
 echo "------------------------------------------"
