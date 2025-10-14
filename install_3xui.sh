@@ -1,82 +1,75 @@
 #!/bin/bash
-# =======================================
-# Автоматическая установка 3X-UI на Ubuntu/Debian
+# Автоматическая установка 3X-UI с веб-интерфейсом
 # Автор: ChatGPT (для nutson.us)
 # =======================================
 
 set -e
-export DEBIAN_FRONTEND=noninteractive
-
-# Проверка root
-if [ "$EUID" -ne 0 ]; then
-  echo "❌ Пожалуйста, запустите скрипт с правами root (sudo)"
-  exit 1
-fi
 
 echo "🔹 Обновляем систему..."
-apt update -y && apt upgrade -yq
+apt update -y && apt upgrade -y
 
 echo "🔹 Устанавливаем зависимости..."
-apt install -y curl wget unzip sudo ufw
+apt install -y curl wget unzip sudo git ufw
 
 echo "🔹 Устанавливаем 3X-UI..."
 bash <(curl -Ls https://raw.githubusercontent.com/mhsanaei/3x-ui/master/install.sh)
 
-# Проверяем, установлен ли бинарь x-ui
-if ! command -v x-ui &> /dev/null; then
-  echo "❌ Ошибка: x-ui не установился. Прерывание."
-  exit 1
-fi
+echo ""
+echo "🔹 Проверяем, установлен ли frontend..."
+if [ ! -d "/usr/local/x-ui/web" ]; then
+    echo "⚙️  Веб-панель отсутствует — скачиваем..."
+    mkdir -p /usr/local/x-ui/web
+    cd /usr/local/x-ui/web
 
-# Проверяем наличие web-фронтенда
-if [ ! -d "/usr/local/x-ui/web" ] || [ -z "$(ls -A /usr/local/x-ui/web 2>/dev/null)" ]; then
-  echo "⚙️ Web-панель отсутствует — скачиваем вручную..."
-  mkdir -p /usr/local/x-ui/web
-  cd /usr/local/x-ui/web
-  wget -q --show-progress https://github.com/MHSanaei/3x-ui-frontend/releases/latest/download/dist.zip
-  unzip -oq dist.zip
-  rm -f dist.zip
-  echo "✅ Веб-файлы фронтенда успешно установлены."
+    # Попробуем стабильный источник FranzKafkaYu (активный форк)
+    wget -q --show-progress https://github.com/FranzKafkaYu/x-ui-frontend/archive/refs/heads/master.zip -O frontend.zip || \
+    wget -q --show-progress https://github.com/MHSanaei/3x-ui-frontend/archive/refs/heads/master.zip -O frontend.zip
+
+    unzip -oq frontend.zip
+    mv x-ui-frontend-*/* /usr/local/x-ui/web/ || true
+    rm -f frontend.zip
+    cd /usr/local/x-ui
+else
+    echo "✅ Веб-панель уже установлена."
 fi
 
 echo ""
-read -p "Введите порт панели (по умолчанию 2053): " PANEL_PORT
-PANEL_PORT=${PANEL_PORT:-2053}
-
-echo "🔹 Настраиваем брандмауэр..."
+echo "🔹 Открываем порты..."
 ufw allow 22/tcp
 ufw allow 443/tcp
-ufw allow $PANEL_PORT/tcp
+ufw allow 2053/tcp
+ufw allow 2096/tcp
 ufw --force enable
 
 echo ""
-echo "🔹 Запускаем и настраиваем X-UI..."
-x-ui restart
+echo "🔹 Запускаем и включаем x-ui..."
+x-ui restart || x-ui start
 x-ui enable
 
+echo ""
 read -p "Введите логин для панели: " PANEL_USER
 read -sp "Введите пароль для панели: " PANEL_PASS
 echo ""
 
+# Настраиваем порт панели
+PANEL_PORT=2053
+
+# Применяем настройки
 x-ui setting -username "$PANEL_USER" -password "$PANEL_PASS" -port "$PANEL_PORT"
 
-# Определяем IP (локальный, если есть)
-LOCAL_IP=$(hostname -I | awk '{print $1}')
-IP=${LOCAL_IP:-$(curl -s ipv4.icanhazip.com)}
+# Получаем локальный IP
+IP=$(hostname -I | awk '{print $1}')
 
-# Узнаём путь к панели
-WEB_PATH=$(grep -oP '(?<=WebBasePath": ")[^"]+' /usr/local/x-ui/bin/config.json || echo "")
-
-x-ui restart
-sleep 3
+# Проверяем WebBasePath
+WEBPATH=$(x-ui settings | grep -oP 'webBasePath:\s*\K.*' | tr -d '[:space:]')
 
 echo ""
 echo "=========================================="
-echo "✅ 3X-UI успешно установлена и готова!"
+echo "✅ 3X-UI успешно установлена и запущена!"
 echo "------------------------------------------"
-echo "🌐 Веб-панель: http://$IP:$PANEL_PORT$WEB_PATH"
+echo "🌐 Веб-панель: http://$IP:$PANEL_PORT$WEBPATH"
 echo "👤 Логин: $PANEL_USER"
 echo "🔑 Пароль: $PANEL_PASS"
 echo "------------------------------------------"
-echo "Чтобы открыть меню x-ui вручную: x-ui"
+echo "Чтобы открыть меню вручную: x-ui"
 echo "=========================================="
