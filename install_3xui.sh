@@ -1,5 +1,5 @@
 #!/bin/bash
-# Автоматическая установка 3X-UI с веб-интерфейсом
+# Автоматическая установка 3X-UI с веб-интерфейсом и автоконфигурацией Xray
 # Автор: ChatGPT (для nutson.us)
 # =======================================
 
@@ -19,16 +19,16 @@ echo "🔹 Проверяем, установлен ли frontend..."
 if [ ! -d "/usr/local/x-ui/web" ]; then
     echo "⚙️  Веб-панель отсутствует — скачиваем..."
     mkdir -p /usr/local/x-ui/web
-    cd /usr/local/x-ui/web
+    cd /usr/local/x-ui/web || exit
 
-    # Попробуем стабильный источник FranzKafkaYu (активный форк)
+    # Пробуем несколько источников фронтенда
     wget -q --show-progress https://github.com/FranzKafkaYu/x-ui-frontend/archive/refs/heads/master.zip -O frontend.zip || \
     wget -q --show-progress https://github.com/MHSanaei/3x-ui-frontend/archive/refs/heads/master.zip -O frontend.zip
 
-    unzip -oq frontend.zip
-    mv x-ui-frontend-*/* /usr/local/x-ui/web/ || true
+    unzip -oq frontend.zip || echo "⚠️ Не удалось распаковать frontend.zip"
+    mv x-ui-frontend-*/* /usr/local/x-ui/web/ 2>/dev/null || true
     rm -f frontend.zip
-    cd /usr/local/x-ui
+    cd /usr/local/x-ui || exit
 else
     echo "✅ Веб-панель уже установлена."
 fi
@@ -54,14 +54,17 @@ echo ""
 # Настраиваем порт панели
 PANEL_PORT=2053
 
-# Применяем настройки
+# Применяем настройки панели
 x-ui setting -username "$PANEL_USER" -password "$PANEL_PASS" -port "$PANEL_PORT"
 
 # Получаем локальный IP
 IP=$(hostname -I | awk '{print $1}')
 
-# Проверяем WebBasePath
+# Проверяем путь панели
 WEBPATH=$(x-ui settings | grep -oP 'webBasePath:\s*\K.*' | tr -d '[:space:]')
+if [ -z "$WEBPATH" ]; then
+    WEBPATH="/"
+fi
 
 echo ""
 echo "=========================================="
@@ -73,3 +76,71 @@ echo "🔑 Пароль: $PANEL_PASS"
 echo "------------------------------------------"
 echo "Чтобы открыть меню вручную: x-ui"
 echo "=========================================="
+
+echo ""
+echo "🔹 Применяем рекомендуемые настройки XRAY..."
+
+cat >/usr/local/x-ui/bin/config.json <<'EOF'
+{
+  "inbounds": [
+    {
+      "port": 443,
+      "protocol": "vless",
+      "settings": {
+        "clients": [
+          {
+            "id": "REPLACE_UUID",
+            "level": 0,
+            "email": "auto@x-ui.local"
+          }
+        ],
+        "decryption": "none"
+      },
+      "streamSettings": {
+        "network": "tcp",
+        "security": "none"
+      }
+    }
+  ],
+  "outbounds": [
+    { "protocol": "freedom", "tag": "direct" },
+    { "protocol": "blackhole", "tag": "block" },
+    {
+      "protocol": "wireguard",
+      "settings": {
+        "address": ["172.16.0.2/32"],
+        "peers": [
+          {
+            "publicKey": "bmXOC+F1FxEMF9dyiK2H5Fz3x3o6r8fVq5u4i+L5rHI=",
+            "endpoint": "162.159.193.10:2408"
+          }
+        ],
+        "mtu": 1280
+      },
+      "tag": "warp"
+    }
+  ],
+  "routing": {
+    "domainStrategy": "IPIfNonMatch",
+    "rules": [
+      { "type": "field", "protocol": ["bittorrent"], "outboundTag": "block" },
+      { "type": "field", "ip": ["geoip:private"], "outboundTag": "block" },
+      { "type": "field", "ip": ["geoip:ru"], "outboundTag": "direct" },
+      { "type": "field", "domain": ["geosite:ru"], "outboundTag": "direct" },
+      { "type": "field", "domain": ["geosite:google", "geosite:openai", "geosite:meta"], "outboundTag": "warp" }
+    ]
+  },
+  "dns": {
+    "servers": ["1.1.1.1", "8.8.8.8"]
+  }
+}
+EOF
+
+# Генерация UUID
+UUID=$(cat /proc/sys/kernel/random/uuid)
+sed -i "s|REPLACE_UUID|$UUID|g" /usr/local/x-ui/bin/config.json
+
+systemctl restart x-ui
+echo ""
+echo "✅ Настройки XRAY применены!"
+echo "🔑 UUID пользователя: $UUID"
