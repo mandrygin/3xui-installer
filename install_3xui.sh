@@ -26,7 +26,12 @@ pkg_install(){
 
 install_3xui(){
   log "🔹 Устанавливаем 3X-UI…"
-  bash <(curl -Ls https://raw.githubusercontent.com/mhsanaei/3x-ui/master/install.sh)
+  # Загружаем установщик во временный файл, чтобы не зависало при потоке
+  TMP_FILE=$(mktemp)
+  curl -fsSL https://raw.githubusercontent.com/mhsanaei/3x-ui/master/install.sh -o "$TMP_FILE" || die "Не удалось загрузить внутренний установщик 3X-UI."
+  bash "$TMP_FILE"
+  rm -f "$TMP_FILE"
+}
 
   # Убираем внешнюю web-папку (новые билды несут фронтенд внутри бинаря)
   if [[ -d /usr/local/x-ui/web ]]; then
