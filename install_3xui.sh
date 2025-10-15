@@ -2,14 +2,16 @@
 set -euo pipefail
 trap 'echo "❌ Ошибка на строке $LINENO: $BASH_COMMAND" >&2' ERR
 
-# ---------- аргументы ----------
+# ---- аргументы ----
 user="${user:-}"; pass="${pass:-}"; port="${port:-}"; WEB_BASEPATH="${webBasePath:-/}"
+INBOUND_PORT="${inbound:-443}"   # порт VLESS-инбаунда (можешь переопределить inbound=2096)
 for kv in "$@"; do
   case "$kv" in
     user=*) user="${kv#*=}" ;;
     pass=*) pass="${kv#*=}" ;;
     port=*) port="${kv#*=}" ;;
     webBasePath=*) WEB_BASEPATH="${kv#*=}" ;;
+    inbound=*) INBOUND_PORT="${kv#*=}" ;;
   esac
 done
 PANEL_USER="${user:-admin}"
@@ -27,16 +29,14 @@ pkg_install(){
   log "🔹 Пакеты…"
   DEBIAN_FRONTEND=noninteractive apt update -y
   DEBIAN_FRONTEND=noninteractive apt upgrade -y
-  DEBIAN_FRONTEND=noninteractive apt install -y curl wget sudo ufw unzip git jq sqlite3 ca-certificates || true
+  DEBIAN_FRONTEND=noninteractive apt install -y curl wget sudo ufw unzip git ca-certificates || true
 }
 
 install_3xui(){
   log "🔹 Установка 3X-UI…"
   tmp="$(mktemp)"
   curl -fsSL --retry 3 --connect-timeout 20 https://raw.githubusercontent.com/mhsanaei/3x-ui/master/install.sh -o "$tmp"
-  bash "$tmp"
-  rm -f "$tmp"
-
+  bash "$tmp"; rm -f "$tmp"
   [[ -x "$UI" ]] || die "Не найден бинарь $UI после установки."
   [[ -d /usr/local/x-ui/web ]] && rm -rf /usr/local/x-ui/web || true
   systemctl daemon-reload || true
@@ -54,55 +54,15 @@ wait_ready(){
   die "x-ui не отвечает на CLI."
 }
 
-port_taken_by_other(){
-  ss -lntp 2>/dev/null | awk -v p=":$1" '$4 ~ p {print $0}' | grep -qv x-ui || return 1
-}
-
-pick_free_port(){
-  for i in {1..50}; do
-    p="$(shuf -i 1025-65535 -n 1)"
-    ss -lnt 2>/dev/null | grep -q ":$p " || { echo "$p"; return 0; }
-  done
-  echo 2053
-}
-
 apply_panel_settings(){
   log "🔹 Применяю логин/пароль/порт…"
-
-  # если указанный порт занят не x-ui — подберём свободный
-  if ss -lntp 2>/dev/null | awk -v p=":$PANEL_PORT" '$4 ~ p {print $0}' | grep -qv x-ui; then
-    local newp
-    newp="$(shuf -i 1025-65535 -n 1)"
-    log "⚠️ Порт $PANEL_PORT занят другим процессом. Ставлю $newp"
-    PANEL_PORT="$newp"
-  fi
-
-  # ВАЖНО: ключи через '=' и только бинарь, код возврата игнорируем
-  /usr/local/x-ui/x-ui setting -username="$PANEL_USER" -password="$PANEL_PASS" -port="$PANEL_PORT" -webBasePath="$WEB_BASEPATH" >/dev/null 2>&1 || true
-
-  # надёжная валидация: парсим текст вывода (не код возврата)
-  local show cur_port cur_base
-  show="$(/usr/local/x-ui/x-ui setting -show 2>&1 || true)"
-  cur_port="$(printf '%s\n' "$show" | awk -F': *' '/^port:/{print $2}' | tr -d '[:space:]')"
-  cur_base="$(printf '%s\n' "$show" | awk -F': *' '/^webBasePath:/{print $2}')"
-
-  if [[ "$cur_port" != "$PANEL_PORT" || -z "$cur_port" ]]; then
-    log "⚠️ Повторно применяю порт…"
-    /usr/local/x-ui/x-ui setting -port="$PANEL_PORT" >/dev/null 2>&1 || true
-    sleep 1
-    show="$(/usr/local/x-ui/x-ui setting -show 2>&1 || true)"
-    cur_port="$(printf '%s\n' "$show" | awk -F': *' '/^port:/{print $2}' | tr -d '[:space:]')"
-  fi
-
-  if [[ -z "$cur_base" || "$cur_base" == "null" ]]; then
-    /usr/local/x-ui/x-ui setting -webBasePath="$WEB_BASEPATH" >/dev/null 2>&1 || true
-  fi
-
-  systemctl restart x-ui
-  sleep 2
-  log "✅ Порт панели: $cur_port, webBasePath: ${cur_base:-$WEB_BASEPATH}"
+  # ключи только в виде key=value
+  "$UI" setting -username="$PANEL_USER" -password="$PANEL_PASS" -port="$PANEL_PORT" -webBasePath="$WEB_BASEPATH" >/dev/null 2>&1 || true
+  # валидация по выводу (код возврата игнорируем)
+  show="$("$UI" setting -show 2>&1 || true)"
+  echo "$show" | grep -q "port: $PANEL_PORT" || die "Панель не приняла порт ($PANEL_PORT)."
+  systemctl restart x-ui; sleep 2
 }
-
 
 ensure_listen(){
   log "🔹 Проверяю, что x-ui слушает $PANEL_PORT…"
@@ -119,99 +79,58 @@ open_firewall(){
   ufw allow 443/tcp >/dev/null 2>&1 || true
   ufw allow 2096/tcp >/dev/null 2>&1 || true
   ufw allow "$PANEL_PORT"/tcp >/dev/null 2>&1 || true
+  ufw allow "$INBOUND_PORT"/tcp >/dev/null 2>&1 || true
   ufw --force enable >/dev/null 2>&1 || true
 }
 
-patch_xray_routing(){
-  local CFG="/usr/local/x-ui/bin/config.json"
+write_xray_config(){
+  log "🔹 Переписываю Xray config.json…"
   mkdir -p "$(dirname "$CFG")"
-
-  # если файл пуст/мусор/массив — кладём базовый объект
-  if ! jq -e 'type=="object"' "$CFG" >/dev/null 2>&1; then
-    cat >"$CFG" <<'JSON'
-{ "log":{"loglevel":"warning"}, "dns":null, "inbounds":[], "outbounds":[], "routing":{"domainStrategy":"IPIfNonMatch","rules":[]} }
-JSON
-  fi
-
-  local tmpcfg; tmpcfg="$(mktemp)"
-  jq '
-    .dns = {"servers":["1.1.1.1","8.8.8.8"]} |
-
-    .outbounds = (
-      ( [.outbounds[]? | select(.protocol=="freedom")] + [{"protocol":"freedom","tag":"direct"}] ) | unique_by(.protocol)
-      + ( [.outbounds[]? | select(.protocol=="blackhole")] + [{"protocol":"blackhole","tag":"block"}] ) | unique_by(.protocol)
-    ) |
-
-    .outbounds = ( [.outbounds[]? | select(.tag!="warp")] + [{
-      "protocol":"wireguard","tag":"warp",
-      "settings":{"address":["172.16.0.2/32"],
-                  "peers":[{"publicKey":"bmXOC+F1FxEMF9dyiK2H5Fz3x3o6r8fVq5u4i+L5rHI=","endpoint":"162.159.193.10:2408"}],
-                  "mtu":1280}
-    }] ) |
-
-    .routing.domainStrategy = "IPIfNonMatch" |
-    .routing.rules = (
-      [ .routing.rules[]? |
-        select(
-          (.protocol? // [] | index("bittorrent") | not)
-          and (.ip? // [] | index("geoip:private") | not)
-          and (.ip? // [] | index("geoip:ru") | not)
-          and (.domain? // [] | index("geosite:ru") | not)
-          and (.domain? // [] | (index("geosite:google") or index("geosite:openai") or index("geosite:meta")) | not)
-        )
-      ]
-      + [
-        {"type":"field","protocol":["bittorrent"],"outboundTag":"block"},
-        {"type":"field","ip":["geoip:private"],"outboundTag":"block"},
-        {"type":"field","ip":["geoip:ru"],"outboundTag":"direct"},
-        {"type":"field","domain":["geosite:ru"],"outboundTag":"direct"},
-        {"type":"field","domain":["geosite:google","geosite:openai","geosite:meta"],"outboundTag":"warp"}
-      ]
-    )
-  ' "$CFG" > "$tmpcfg" || { echo "❌ jq patch failed, falling back to full rewrite"; rm -f "$tmpcfg"; return 1; }
-
-  mv "$tmpcfg" "$CFG"
-  chmod 644 "$CFG"
-  systemctl restart x-ui || true
-  sleep 1
+  uuid="$(cat /proc/sys/kernel/random/uuid)"
+  cat >"$CFG" <<JSON
+{
+  "log": { "loglevel": "warning" },
+  "dns": { "servers": ["1.1.1.1", "8.8.8.8"] },
+  "inbounds": [
+    {
+      "port": $INBOUND_PORT,
+      "protocol": "vless",
+      "settings": {
+        "clients": [
+          { "id": "$uuid", "level": 0, "email": "auto@x-ui.local" }
+        ],
+        "decryption": "none"
+      },
+      "streamSettings": { "network": "tcp", "security": "none" }
+    }
+  ],
+  "outbounds": [
+    { "protocol": "freedom",  "tag": "direct" },
+    { "protocol": "blackhole","tag": "block"  },
+    {
+      "protocol": "wireguard",
+      "tag": "warp",
+      "settings": {
+        "address": ["172.16.0.2/32"],
+        "peers": [
+          { "publicKey": "bmXOC+F1FxEMF9dyiK2H5Fz3x3o6r8fVq5u4i+L5rHI=", "endpoint": "162.159.193.10:2408" }
+        ],
+        "mtu": 1280
+      }
+    }
+  ],
+  "routing": {
+    "domainStrategy": "IPIfNonMatch",
+    "rules": [
+      { "type": "field", "protocol": ["bittorrent"], "outboundTag": "block" },
+      { "type": "field", "ip": ["geoip:private"],     "outboundTag": "block"  },
+      { "type": "field", "ip": ["geoip:ru"],          "outboundTag": "direct" },
+      { "type": "field", "domain": ["geosite:ru"],    "outboundTag": "direct" },
+      { "type": "field", "domain": ["geosite:google","geosite:openai","geosite:meta"], "outboundTag": "warp" }
+    ]
+  }
 }
-
-
-  tmpcfg="$(mktemp)"
-  jq '
-    .dns = {"servers":["1.1.1.1","8.8.8.8"]} |
-    .outbounds = (
-      ( [.outbounds[]? | select(.protocol=="freedom")] + [{"protocol":"freedom","tag":"direct"}] ) | unique_by(.protocol)
-      + ( [.outbounds[]? | select(.protocol=="blackhole")] + [{"protocol":"blackhole","tag":"block"}] ) | unique_by(.protocol)
-    ) |
-    .outbounds = ( [.outbounds[]? | select(.tag!="warp")] + [{
-      "protocol":"wireguard","tag":"warp",
-      "settings":{"address":["172.16.0.2/32"],
-                  "peers":[{"publicKey":"bmXOC+F1FxEMF9dyiK2H5Fz3x3o6r8fVq5u4i+L5rHI=","endpoint":"162.159.193.10:2408"}],
-                  "mtu":1280}
-    }] ) |
-    .routing.domainStrategy = "IPIfNonMatch" |
-    .routing.rules = (
-      [
-        .routing.rules[]? |
-        select(
-          (.protocol? // [] | index("bittorrent") | not)
-          and (.ip? // [] | index("geoip:private") | not)
-          and (.ip? // [] | index("geoip:ru") | not)
-          and (.domain? // [] | index("geosite:ru") | not)
-          and (.domain? // [] | (index("geosite:google") or index("geosite:openai") or index("geosite:meta")) | not)
-        )
-      ]
-      + [
-        {"type":"field","protocol":["bittorrent"],"outboundTag":"block"},
-        {"type":"field","ip":["geoip:private"],"outboundTag":"block"},
-        {"type":"field","ip":["geoip:ru"],"outboundTag":"direct"},
-        {"type":"field","domain":["geosite:ru"],"outboundTag":"direct"},
-        {"type":"field","domain":["geosite:google","geosite:openai","geosite:meta"],"outboundTag":"warp"}
-      ]
-    )
-  ' "$CFG" > "$tmpcfg"
-  mv "$tmpcfg" "$CFG"
+JSON
   chmod 644 "$CFG"
   systemctl restart x-ui || true
   sleep 1
@@ -229,12 +148,12 @@ print_access(){
   echo "🔑 Пароль: $PANEL_PASS"
   echo "------------------------------------------"
   echo "Файл Xray-конфига: $CFG"
-  echo "Текущие настройки панели:"
-  "$UI" setting -show 2>&1 || true
+  echo "UUID VLESS: $uuid"
+  echo "Inbound порт: $INBOUND_PORT"
   echo "=========================================="
 }
 
-# ---------- MAIN ----------
+# ---- MAIN ----
 need_root
 pkg_install
 install_3xui
@@ -242,5 +161,5 @@ wait_ready
 apply_panel_settings
 ensure_listen
 open_firewall
-patch_xray_routing
+write_xray_config
 print_access
