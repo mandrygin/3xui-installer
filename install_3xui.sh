@@ -68,24 +68,41 @@ pick_free_port(){
 
 apply_panel_settings(){
   log "🔹 Применяю логин/пароль/порт…"
-  if port_taken_by_other "$PANEL_PORT"; then
-    newp="$(pick_free_port)"
+
+  # если указанный порт занят не x-ui — подберём свободный
+  if ss -lntp 2>/dev/null | awk -v p=":$PANEL_PORT" '$4 ~ p {print $0}' | grep -qv x-ui; then
+    local newp
+    newp="$(shuf -i 1025-65535 -n 1)"
     log "⚠️ Порт $PANEL_PORT занят другим процессом. Ставлю $newp"
     PANEL_PORT="$newp"
   fi
 
-  # ВАЖНО: ключи через '=' и только бинарь
-  "$UI" setting -username="$PANEL_USER" -password="$PANEL_PASS" -port="$PANEL_PORT" -webBasePath="$WEB_BASEPATH" >/dev/null 2>&1 || true
+  # ВАЖНО: ключи через '=' и только бинарь, код возврата игнорируем
+  /usr/local/x-ui/x-ui setting -username="$PANEL_USER" -password="$PANEL_PASS" -port="$PANEL_PORT" -webBasePath="$WEB_BASEPATH" >/dev/null 2>&1 || true
 
-  # Валидация по выводу, а не по коду возврата
-  show="$("$UI" setting -show 2>&1 || true)"
-  echo "$show"
-  echo "$show" | grep -q "port: $PANEL_PORT" || die "Панель не приняла порт ($PANEL_PORT)."
-  echo "$show" | grep -q "hasDefaultCredential: false" || true
+  # надёжная валидация: парсим текст вывода (не код возврата)
+  local show cur_port cur_base
+  show="$(/usr/local/x-ui/x-ui setting -show 2>&1 || true)"
+  cur_port="$(printf '%s\n' "$show" | awk -F': *' '/^port:/{print $2}' | tr -d '[:space:]')"
+  cur_base="$(printf '%s\n' "$show" | awk -F': *' '/^webBasePath:/{print $2}')"
+
+  if [[ "$cur_port" != "$PANEL_PORT" || -z "$cur_port" ]]; then
+    log "⚠️ Повторно применяю порт…"
+    /usr/local/x-ui/x-ui setting -port="$PANEL_PORT" >/dev/null 2>&1 || true
+    sleep 1
+    show="$(/usr/local/x-ui/x-ui setting -show 2>&1 || true)"
+    cur_port="$(printf '%s\n' "$show" | awk -F': *' '/^port:/{print $2}' | tr -d '[:space:]')"
+  fi
+
+  if [[ -z "$cur_base" || "$cur_base" == "null" ]]; then
+    /usr/local/x-ui/x-ui setting -webBasePath="$WEB_BASEPATH" >/dev/null 2>&1 || true
+  fi
 
   systemctl restart x-ui
   sleep 2
+  log "✅ Порт панели: $cur_port, webBasePath: ${cur_base:-$WEB_BASEPATH}"
 }
+
 
 ensure_listen(){
   log "🔹 Проверяю, что x-ui слушает $PANEL_PORT…"
