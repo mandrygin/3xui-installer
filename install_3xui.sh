@@ -2,7 +2,7 @@
 set -euo pipefail
 trap 'echo "❌ Ошибка на строке $LINENO: $BASH_COMMAND" >&2' ERR
 
-# ---------- ПАРАМЕТРЫ ИЗ АРГУМЕНТОВ ----------
+# ---------- аргументы ----------
 user="${user:-}"; pass="${pass:-}"; port="${port:-}"; WEB_BASEPATH="${webBasePath:-/}"
 for kv in "$@"; do
   case "$kv" in
@@ -16,7 +16,7 @@ PANEL_USER="${user:-admin}"
 PANEL_PASS="${pass:-$(tr -dc 'A-Za-z0-9!@#\$%_' </dev/urandom | head -c 14)}"
 PANEL_PORT="${port:-2053}"
 
-UI="/usr/local/x-ui/x-ui"         # бинарь панели
+UI="/usr/local/x-ui/x-ui"
 CFG="/usr/local/x-ui/bin/config.json"
 
 log(){ echo -e "$@"; }
@@ -38,18 +38,17 @@ install_3xui(){
   rm -f "$tmp"
 
   [[ -x "$UI" ]] || die "Не найден бинарь $UI после установки."
-  # старый внешний фронт больше не нужен
   [[ -d /usr/local/x-ui/web ]] && rm -rf /usr/local/x-ui/web || true
-
   systemctl daemon-reload || true
   "$UI" enable || true
   "$UI" start  || true
 }
 
 wait_ready(){
-  # ждём, пока x-ui начнёт отвечать на CLI
+  log "🔹 Жду готовности CLI…"
   for i in {1..40}; do
-    "$UI" setting -show >/dev/null 2>&1 && return 0
+    out="$("$UI" setting -show 2>&1 || true)"
+    echo "$out" | grep -q "port:" && return 0
     sleep 1
   done
   die "x-ui не отвечает на CLI."
@@ -68,23 +67,21 @@ pick_free_port(){
 }
 
 apply_panel_settings(){
-  log "🔹 Применяем логин/пароль/порт панели…"
-
-  # если указанный порт занят не x-ui — подберём свободный
+  log "🔹 Применяю логин/пароль/порт…"
   if port_taken_by_other "$PANEL_PORT"; then
     newp="$(pick_free_port)"
     log "⚠️ Порт $PANEL_PORT занят другим процессом. Ставлю $newp"
     PANEL_PORT="$newp"
   fi
 
-  # обязательно синтаксис КЛЮЧ=ЗНАЧЕНИЕ
-  "$UI" setting -username="$PANEL_USER" -password="$PANEL_PASS" -port="$PANEL_PORT" -webBasePath="$WEB_BASEPATH"
+  # ВАЖНО: ключи через '=' и только бинарь
+  "$UI" setting -username="$PANEL_USER" -password="$PANEL_PASS" -port="$PANEL_PORT" -webBasePath="$WEB_BASEPATH" >/dev/null 2>&1 || true
 
-  # валидация
-  if ! "$UI" setting -show | grep -q "port: $PANEL_PORT"; then
-    "$UI" setting -show >&2 || true
-    die "x-ui не принял настройки панели."
-  fi
+  # Валидация по выводу, а не по коду возврата
+  show="$("$UI" setting -show 2>&1 || true)"
+  echo "$show"
+  echo "$show" | grep -q "port: $PANEL_PORT" || die "Панель не приняла порт ($PANEL_PORT)."
+  echo "$show" | grep -q "hasDefaultCredential: false" || true
 
   systemctl restart x-ui
   sleep 2
@@ -109,8 +106,7 @@ open_firewall(){
 }
 
 patch_xray_routing(){
-  log "🔹 Патчу Xray-маршрутизацию (BT/private → block; RU → direct; Google/OpenAI/Meta → WARP)…"
-
+  log "🔹 Патчу Xray (BT/private → block; RU → direct; Google/OpenAI/Meta → WARP)…"
   mkdir -p "$(dirname "$CFG")"
   [[ -s "$CFG" ]] || cat >"$CFG" <<'JSON'
 { "log":{"loglevel":"warning"}, "dns":null, "inbounds":[], "outbounds":[], "routing":{"domainStrategy":"IPIfNonMatch","rules":[]} }
@@ -119,21 +115,16 @@ JSON
   tmpcfg="$(mktemp)"
   jq '
     .dns = {"servers":["1.1.1.1","8.8.8.8"]} |
-
-    # гарантируем outbounds direct/blackhole
     .outbounds = (
       ( [.outbounds[]? | select(.protocol=="freedom")] + [{"protocol":"freedom","tag":"direct"}] ) | unique_by(.protocol)
       + ( [.outbounds[]? | select(.protocol=="blackhole")] + [{"protocol":"blackhole","tag":"block"}] ) | unique_by(.protocol)
     ) |
-
-    # добавим/обновим warp (wireguard)
-    .outbounds = (
-      [.outbounds[]? | select(.tag!="warp")] + [{
-        "protocol":"wireguard","tag":"warp",
-        "settings":{"address":["172.16.0.2/32"],"peers":[{"publicKey":"bmXOC+F1FxEMF9dyiK2H5Fz3x3o6r8fVq5u4i+L5rHI=","endpoint":"162.159.193.10:2408"}],"mtu":1280}
-      }]
-    ) |
-
+    .outbounds = ( [.outbounds[]? | select(.tag!="warp")] + [{
+      "protocol":"wireguard","tag":"warp",
+      "settings":{"address":["172.16.0.2/32"],
+                  "peers":[{"publicKey":"bmXOC+F1FxEMF9dyiK2H5Fz3x3o6r8fVq5u4i+L5rHI=","endpoint":"162.159.193.10:2408"}],
+                  "mtu":1280}
+    }] ) |
     .routing.domainStrategy = "IPIfNonMatch" |
     .routing.rules = (
       [
@@ -155,7 +146,6 @@ JSON
       ]
     )
   ' "$CFG" > "$tmpcfg"
-
   mv "$tmpcfg" "$CFG"
   chmod 644 "$CFG"
   systemctl restart x-ui || true
@@ -175,7 +165,7 @@ print_access(){
   echo "------------------------------------------"
   echo "Файл Xray-конфига: $CFG"
   echo "Текущие настройки панели:"
-  "$UI" setting -show || true
+  "$UI" setting -show 2>&1 || true
   echo "=========================================="
 }
 
