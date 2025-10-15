@@ -123,11 +123,59 @@ open_firewall(){
 }
 
 patch_xray_routing(){
-  log "🔹 Патчу Xray (BT/private → block; RU → direct; Google/OpenAI/Meta → WARP)…"
+  local CFG="/usr/local/x-ui/bin/config.json"
   mkdir -p "$(dirname "$CFG")"
-  [[ -s "$CFG" ]] || cat >"$CFG" <<'JSON'
+
+  # если файл пуст/мусор/массив — кладём базовый объект
+  if ! jq -e 'type=="object"' "$CFG" >/dev/null 2>&1; then
+    cat >"$CFG" <<'JSON'
 { "log":{"loglevel":"warning"}, "dns":null, "inbounds":[], "outbounds":[], "routing":{"domainStrategy":"IPIfNonMatch","rules":[]} }
 JSON
+  fi
+
+  local tmpcfg; tmpcfg="$(mktemp)"
+  jq '
+    .dns = {"servers":["1.1.1.1","8.8.8.8"]} |
+
+    .outbounds = (
+      ( [.outbounds[]? | select(.protocol=="freedom")] + [{"protocol":"freedom","tag":"direct"}] ) | unique_by(.protocol)
+      + ( [.outbounds[]? | select(.protocol=="blackhole")] + [{"protocol":"blackhole","tag":"block"}] ) | unique_by(.protocol)
+    ) |
+
+    .outbounds = ( [.outbounds[]? | select(.tag!="warp")] + [{
+      "protocol":"wireguard","tag":"warp",
+      "settings":{"address":["172.16.0.2/32"],
+                  "peers":[{"publicKey":"bmXOC+F1FxEMF9dyiK2H5Fz3x3o6r8fVq5u4i+L5rHI=","endpoint":"162.159.193.10:2408"}],
+                  "mtu":1280}
+    }] ) |
+
+    .routing.domainStrategy = "IPIfNonMatch" |
+    .routing.rules = (
+      [ .routing.rules[]? |
+        select(
+          (.protocol? // [] | index("bittorrent") | not)
+          and (.ip? // [] | index("geoip:private") | not)
+          and (.ip? // [] | index("geoip:ru") | not)
+          and (.domain? // [] | index("geosite:ru") | not)
+          and (.domain? // [] | (index("geosite:google") or index("geosite:openai") or index("geosite:meta")) | not)
+        )
+      ]
+      + [
+        {"type":"field","protocol":["bittorrent"],"outboundTag":"block"},
+        {"type":"field","ip":["geoip:private"],"outboundTag":"block"},
+        {"type":"field","ip":["geoip:ru"],"outboundTag":"direct"},
+        {"type":"field","domain":["geosite:ru"],"outboundTag":"direct"},
+        {"type":"field","domain":["geosite:google","geosite:openai","geosite:meta"],"outboundTag":"warp"}
+      ]
+    )
+  ' "$CFG" > "$tmpcfg" || { echo "❌ jq patch failed, falling back to full rewrite"; rm -f "$tmpcfg"; return 1; }
+
+  mv "$tmpcfg" "$CFG"
+  chmod 644 "$CFG"
+  systemctl restart x-ui || true
+  sleep 1
+}
+
 
   tmpcfg="$(mktemp)"
   jq '
